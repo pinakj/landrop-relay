@@ -24,7 +24,7 @@ setInterval(() => {
   const cutoff = Date.now() - TTL_MS;
   for (const [id, t] of transfers) {
     if (t.createdAt < cutoff) {
-      fs.rm(t.filePath, { force: true }, () => {});
+      if (t.filePath) fs.rm(t.filePath, { force: true }, () => {});
       transfers.delete(id);
     }
   }
@@ -80,11 +80,95 @@ function declinedPage() {
     `<h1>Declined</h1><p>You declined the incoming file. This transfer has been discarded.</p>`);
 }
 
+function preparingPage(senderName, fileName, id) {
+  return html('LANDrop — preparing…',
+    `<h1>Preparing transfer…</h1>
+     <p><span class="name">${esc(senderName)}</span> is sending you <span class="file">${esc(fileName)}</span>.</p>
+     <p class="muted">The file is still uploading. This page will refresh automatically.</p>
+     <script>
+       (function poll() {
+         fetch('/r/${id}/status').then(r=>r.json()).then(d=>{
+           if (d.state !== 'preparing') location.reload();
+           else setTimeout(poll, 1500);
+         }).catch(()=>setTimeout(poll,2000));
+       })();
+     </script>`);
+}
+
 function errorPage(msg) {
   return html('LANDrop — error', `<h1>Oops</h1><p>${esc(msg)}</p>`);
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
+
+// POST /register  — creates a transfer record and returns the public URL immediately,
+// before any file data is sent. The client then uploads the file separately.
+app.post('/register', express.json(), (req, res) => {
+  const senderName  = String(req.body?.senderName  || 'Someone').slice(0, 120);
+  const fileName    = String(req.body?.fileName    || 'file').slice(0, 255);
+  const contentType = String(req.body?.contentType || 'application/octet-stream');
+
+  const id = crypto.randomBytes(5).toString('hex');
+  transfers.set(id, {
+    senderName, fileName, contentType,
+    filePath: null,
+    state: 'preparing',   // waiting for the file upload to finish
+    createdAt: Date.now(),
+  });
+
+  res.json({ id, url: `${baseUrl(req)}/r/${id}`, expiresIn: 3600 });
+});
+
+// PUT /r/:id/upload-stream  — streams the file for a pre-registered transfer.
+app.put('/r/:id/upload-stream', (req, res) => {
+  const t = transfers.get(req.params.id);
+  if (!t) return res.status(404).json({ error: 'Transfer not found.' });
+  if (t.state !== 'preparing') return res.status(409).json({ error: 'Already uploaded.' });
+
+  const tmpPath = path.join(os.tmpdir(), `landrop-${crypto.randomBytes(8).toString('hex')}`);
+  const out     = fs.createWriteStream(tmpPath);
+
+  req.pipe(out);
+
+  out.on('error', (err) => {
+    fs.rm(tmpPath, { force: true }, () => {});
+    res.status(500).json({ error: `Write error: ${err.message}` });
+  });
+
+  out.on('finish', () => {
+    t.filePath = tmpPath;
+    t.state    = 'pending';
+    res.json({ ok: true });
+  });
+});
+
+// PUT /upload-stream  — legacy single-step upload (kept for older clients).
+app.put('/upload-stream', (req, res) => {
+  const senderName  = String(req.query.senderName  || 'Someone').slice(0, 120);
+  const fileName    = String(req.query.fileName    || 'file').slice(0, 255);
+  const contentType = String(req.query.contentType || 'application/octet-stream');
+
+  const tmpPath = path.join(os.tmpdir(), `landrop-${crypto.randomBytes(8).toString('hex')}`);
+  const out     = fs.createWriteStream(tmpPath);
+
+  req.pipe(out);
+
+  out.on('error', (err) => {
+    fs.rm(tmpPath, { force: true }, () => {});
+    res.status(500).json({ error: `Write error: ${err.message}` });
+  });
+
+  out.on('finish', () => {
+    const id = crypto.randomBytes(5).toString('hex');
+    transfers.set(id, {
+      senderName, fileName, contentType,
+      filePath: tmpPath,
+      state: 'pending',
+      createdAt: Date.now(),
+    });
+    res.json({ id, url: `${baseUrl(req)}/r/${id}`, expiresIn: 3600 });
+  });
+});
 
 // POST /upload  — sender uploads the file, gets back a public URL
 app.post('/upload', upload.single('file'), (req, res) => {
@@ -111,6 +195,7 @@ app.get('/r/:id', (req, res) => {
   if (!t) return res.status(404).send(errorPage('This transfer has expired or does not exist.'));
   if (t.state === 'downloaded') return res.status(410).send(errorPage('This file has already been downloaded.'));
   if (t.state === 'declined')   return res.status(410).send(declinedPage());
+  if (t.state === 'preparing')  return res.send(preparingPage(t.senderName, t.fileName, req.params.id));
   res.send(approvePage(t.senderName, t.fileName, req.params.id));
 });
 
